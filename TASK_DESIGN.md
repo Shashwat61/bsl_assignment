@@ -2,14 +2,14 @@
 
 ## Overview
 
-A Flask REST API was deployed with PostgreSQL and Redis in a single Docker container. The app code is mostly correct, but the **infrastructure/configuration is broken** in 5 subtle ways. The AI agent must act like a sysadmin debugging a broken deployment.
+A Flask REST API was deployed with PostgreSQL and Redis in a single Docker container. The app code is mostly correct, but the **infrastructure/configuration is broken** in 6 subtle ways. The AI agent must act like a sysadmin debugging a broken deployment.
 
 ---
 
-## The 5 Bugs
+## The 6 Bugs
 
 ### Bug 1: Postgres Won't Accept TCP Connections
-- **Where:** `postgresql.conf` (inside the container at `/var/lib/postgresql/16/main/postgresql.conf`)
+- **Where:** `postgresql.conf` (inside the container at `/etc/postgresql/15/main/postgresql.conf`)
 - **What:** `listen_addresses = ''` (empty string = no TCP)
 - **Symptom:** `connection refused` on any database operation
 - **Fix:** Change to `listen_addresses = 'localhost'`
@@ -24,7 +24,7 @@ A Flask REST API was deployed with PostgreSQL and Redis in a single Docker conta
 
 ### Bug 3: Startup Race Condition
 - **Where:** `start.sh`
-- **What:** Flask starts immediately after `pg_ctl start`, before Postgres is ready to accept connections
+- **What:** Flask starts immediately after `pg_ctlcluster start`, before Postgres is ready to accept connections
 - **Symptom:** First requests fail because tables aren't accessible yet. Intermittent — sometimes works if Postgres starts fast enough.
 - **Fix:** Add a `pg_isready` wait loop in start.sh before starting Flask
 - **Why it's hard:** If the AI manually starts services during debugging, the timing might be fine. But the test checks that start.sh has a proper readiness check.
@@ -42,6 +42,13 @@ A Flask REST API was deployed with PostgreSQL and Redis in a single Docker conta
 - **Symptom:** `INSERT` fails with `value too long for type character varying(50)` — but only for long emails
 - **Fix:** Change to `VARCHAR(255)` in init_db.sql + run `ALTER TABLE users ALTER COLUMN email TYPE VARCHAR(255)` on the live DB
 - **Why it's hard:** Short emails work fine. Only triggered by specific test data. The AI has to trace the error back to the schema definition.
+
+### Bug 6: Wrong Redis Port (Third Layer for Redis)
+- **Where:** Dockerfile `ENV REDIS_PORT=6380`
+- **What:** Environment variable says port 6380, but Redis runs on default 6379
+- **Symptom:** Even after fixing the Redis password (Bug 2), Redis connection still fails silently
+- **Fix:** Change `REDIS_PORT=6380` to `REDIS_PORT=6379`
+- **Why it's hard:** Compounds with Bug 2 — the agent might fix the password and still see Redis failing, thinking the password fix was wrong. It's a triple-layer Redis debugging challenge (wrong port + missing password + silent failure).
 
 ---
 
@@ -73,6 +80,9 @@ App seems to work! CRUD operations pass! But...
     |   (app falls back to DB, looks fine unless you test caching specifically)
     |   (add password to Redis connection)
     |
+    +-- Still broken! Bug 6: REDIS_PORT=6380 in env (Redis is on 6379)
+    |   (fix env var)
+    |
     +-- Bug 5: Long emails fail
         (only shows up with emails >50 chars)
         (fix VARCHAR(50) → VARCHAR(255))
@@ -86,6 +96,7 @@ App seems to work! CRUD operations pass! But...
 broken_flask_deployment/
 ├── task.toml
 ├── instruction.md
+├── ARCHITECTURE.md
 ├── environment/
 │   ├── Dockerfile
 │   ├── app.py
@@ -97,7 +108,7 @@ broken_flask_deployment/
 ├── solution/
 │   └── solve.sh
 └── tests/
-    ├── test.sh          (don't touch — Harbor standard)
+    ├── test.sh          (Harbor standard)
     └── test_outputs.py
 ```
 
@@ -120,15 +131,15 @@ broken_flask_deployment/
 | # | Test | What It Checks | Which Bug It Catches |
 |---|------|---------------|---------------------|
 | 1 | `test_services_running` | `ps aux` shows postgres, redis, python processes | General startup |
-| 2 | `test_health_endpoint` | GET /health → 200, all services "connected" | Bugs 1, 2, 3, 4 |
+| 2 | `test_health_endpoint` | GET /health → 200, all services "connected" | Bugs 1, 2, 3, 4, 6 |
 | 3 | `test_create_user` | POST /users → 201 with correct data | Bugs 1, 3, 4 |
 | 4 | `test_get_user` | GET /users/id → correct user data | Bugs 1, 3, 4 |
 | 5 | `test_list_users` | GET /users → list with required fields | Bugs 1, 3, 4 |
 | 6 | `test_delete_user` | DELETE then GET → 404 | Bugs 1, 3, 4 |
 | 7 | `test_delete_nonexistent_user` | DELETE /users/99999 → 404 | Bugs 1, 3, 4 |
-| 8 | `test_redis_caching` | 1st GET source="database", 2nd GET source="cache" | **Bug 2** |
-| 9 | `test_long_email` | POST with 88-char email works + not truncated | **Bug 5** |
-| 10 | `test_startup_script_works` | start.sh exists, executable, contains pg_isready | **Bug 3** |
+| 8 | `test_redis_caching` | 1st GET source="database", 2nd GET source="cache" | **Bugs 2, 6** |
+| 9 | `test_long_email` | POST with 77-char email works + not truncated | **Bug 5** |
+| 10 | `test_startup_script_works` | start.sh exists, executable, has readiness check | **Bug 3** |
 
 ---
 
@@ -140,7 +151,7 @@ version = "1.0"
 
 [metadata]
 author_name = "Shashwat"
-author_email = "your_email@example.com"
+author_email = "shashwat@example.com"
 difficulty = "hard"
 category = "system-administration"
 tags = ["devops", "docker", "database", "web-server", "debugging"]
@@ -167,16 +178,16 @@ python = "3.12"
 - Tells the AI: "A Flask API with Postgres and Redis is deployed here but broken. Debug and fix it."
 - Lists the expected endpoints and what they should do
 - Mentions start.sh is the entrypoint
-- Mentions config file locations (so AI knows the landscape)
-- Hints about long email support and Redis caching being functional
+- Hints about Redis caching being functional and email length support
 - Does NOT mention specific bugs, config values, or fixes
 
 ### environment/Dockerfile
 - Base: `python:3.12-slim-bookworm`
-- Installs: `postgresql-16`, `redis-server`, `curl`, `procps`
-- Sets up Postgres DB + user during build (initdb, create user/db, run init_db.sql)
+- Installs: `postgresql-15`, `redis-server`, `curl`, `procps`
+- Sets up Postgres DB + user during build (pg_ctlcluster, create user/db)
 - **Injects Bug 1:** Appends `listen_addresses = ''` to postgresql.conf AFTER setup
 - **Injects Bug 4:** Sets `ENV DB_PORT=5433`
+- **Injects Bug 6:** Sets `ENV REDIS_PORT=6380`
 - Copies all environment files to /app/
 - Does NOT include solution/ or tests/
 
@@ -212,11 +223,13 @@ gunicorn==23.0.0
 
 ### solution/solve.sh
 1. Fix postgresql.conf: `listen_addresses = 'localhost'`
-2. Fix config.py + app.py: add Redis password
-3. Rewrite start.sh with pg_isready wait loop + correct DB_PORT export
-4. Fix init_db.sql: VARCHAR(255)
-5. Start services
-6. ALTER TABLE on running DB for existing schema
+2. Fix DB_PORT env var to 5432
+3. Fix REDIS_PORT env var to 6379
+4. Fix config.py + app.py: add Redis password
+5. Fix init_db.sql: VARCHAR(255)
+6. Rewrite start.sh with pg_isready wait loop
+7. Start services
+8. ALTER TABLE on running DB for existing schema
 
 ### tests/test_outputs.py
 - 10 pytest functions as described in test suite table above
@@ -225,29 +238,18 @@ gunicorn==23.0.0
 
 ---
 
-## Implementation Steps
+## Validation Results
 
-1. Install Harbor CLI: `uv tool install harbor`
-2. Initialize: `harbor tasks init "broken_flask_deployment"`
-3. Write all files listed above
-4. Test Docker build works (may need to adjust package version pins)
-5. Run oracle: `harbor run -p "./broken_flask_deployment" -a oracle` — must pass all 10 tests
-6. Run AI agent: `harbor run -p "./broken_flask_deployment" -a terminus-2 --model groq/moonshotai/kimi-k2-instruct-0905 -k 10 -n 10`
-7. Check: 0% < pass rate < 70%
-8. Adjust difficulty if needed
-9. Zip: `SHASHWAT_LASTNAME_EXORDIOM_20260322.zip`
-10. Email to recruitingops@exordiom.com
+- **Oracle:** 10/10 tests pass (Mean: 1.000)
+- **AI Agent** (terminus-2, kimi-k2-instruct-0905, k=10): Mean: 0.600 (6/10 pass, 4/10 fail)
+- Target range: > 0.0 and < 0.7 ✅
 
 ---
 
-## Difficulty Tuning Levers
+## Difficulty Tuning Applied
 
-**If too easy (>70% pass rate):**
-- Remove hints about long emails from instruction.md
-- Add a 6th bug (e.g., wrong pg_hba.conf auth method)
-- Make the Redis password read from a file instead of hardcoded
+The task was initially too easy (80% pass rate with 5 bugs). We applied:
+1. **Added Bug 6** (wrong REDIS_PORT) — creates a triple-layer Redis debugging challenge
+2. **Removed hints** from instruction.md (removed postgres config path, redis config path, env vars hint)
 
-**If too hard (0% pass rate):**
-- Add more hints in instruction.md
-- Remove Bug 5 (VARCHAR issue)
-- Make Bug 2 non-silent (remove the try/except in get_redis_client)
+This brought the pass rate down to 60%, within the target range.
